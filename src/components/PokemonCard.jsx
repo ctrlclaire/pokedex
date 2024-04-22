@@ -1,15 +1,30 @@
-function PokemonCard() {
+// import PropTypes from 'prop-types';
+import { pokemonCardPropTypes } from './PokemonTypes.jsx';
+
+function PokemonCard({ pokemon, isSelected, onClick }) {
 	return (
 		<div>
-			<figure>
-				<img
-					src="https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/1.png"
-					alt="pokemon"
-				/>
-				<figcaption>Bulbasaur</figcaption>
-			</figure>
+			<ul>
+				<li>
+					<figure>
+						<div
+							onClick={onClick}
+							style={{ border: isSelected ? '2px solid blue' : 'none' }}
+						>
+							<figcaption>{pokemon.name}</figcaption>
+							{pokemon.imgSrc ? (
+								<img src={pokemon.imgSrc} alt={`${pokemon.name}`} />
+							) : (
+								<p>Img: ???</p>
+							)}
+						</div>
+					</figure>
+				</li>
+			</ul>
 		</div>
 	);
 }
+
+PokemonCard.propTypes = pokemonCardPropTypes;
 
 export default PokemonCard;
