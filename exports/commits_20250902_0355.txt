@@ -1,0 +1,20 @@
+=== COMMITS AUDIT POKEDEX - Tue Sep  2 03:55:12 UTC 2025 ===
+Repository: ctrlclaire/pokedex
+
+SHA | Date | Auteur | Signé | Message
+----|----- |--------|-------|--------
+34a9252 | 2025-09-02 | Claire | ✅ | Update test.yml
+6490677 | 2025-09-02 | Claire | ✅ | Create test.yml
+a766335 | 2025-09-02 | Claire | ✅ | Create manual.yml
+eb18620 | 2025-09-02 | Claire | ✅ | audit report
+7a16a59 | 2024-04-22 | Claire | ❌ | navbar selection by index
+f341482 | 2024-04-20 | Claire | ❌ | first component
+f7989c7 | 2024-04-15 | Claire | ❌ | first commit
+
+STATISTIQUES:
+=============
+Total commits analysés: 7
+Commits avec signature GPG: 4
+Commits sans signature: 3
+
+Hash de vérification: 0c1616efafce1b526c80c6ea4c86a658cddf85c3730f225a143b0bd368d8228b
