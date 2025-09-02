@@ -1,0 +1,64 @@
+# .github/workflows/simple-extractor.yml
+name: test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1' # Lundi 9h
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+    - uses: actions/checkout@v4
+      
+    - name: Extract API data
+      run: |
+        mkdir -p exports
+        DATE=$(date +"%Y%m%d_%H%M")
+        
+        # Extract commits from specific repo
+        curl -s "https://api.github.com/repos/ctrlclaire/pokedex/commits?per_page=50" > raw_commits.json
+        
+        # Format to simple txt
+        echo "=== COMMITS AUDIT POKEDEX - $(date) ===" > exports/commits_${DATE}.txt
+        echo "Repository: ctrlclaire/pokedex" >> exports/commits_${DATE}.txt
+        echo "" >> exports/commits_${DATE}.txt
+        
+        cat raw_commits.json | jq -r '.[] | 
+        .sha[0:7] + " | " + 
+        (.commit.author.date | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%d/%m/%Y %H:%M")) + " | " + 
+        .commit.author.name + " | " + 
+        (if .commit.verification.verified then "✅" else "❌") + " | " + 
+        (.commit.message | split("\n")[0])' >> exports/commits_${DATE}.txt
+        
+        # Simple stats
+        echo "" >> exports/commits_${DATE}.txt
+        echo "STATS:" >> exports/commits_${DATE}.txt
+        echo "======" >> exports/commits_${DATE}.txt
+        echo "Total commits: $(cat raw_commits.json | jq 'length')" >> exports/commits_${DATE}.txt
+        echo "Commits signés: $(cat raw_commits.json | jq '[.[] | select(.commit.verification.verified == true)] | length')" >> exports/commits_${DATE}.txt
+        echo "Commits non signés: $(cat raw_commits.json | jq '[.[] | select(.commit.verification.verified == false)] | length')" >> exports/commits_${DATE}.txt
+        
+        # Hash for verification
+        echo "" >> exports/commits_${DATE}.txt
+        echo "Hash SHA256: $(sha256sum exports/commits_${DATE}.txt | cut -d' ' -f1)" >> exports/commits_${DATE}.txt
+        
+        rm raw_commits.json
+        
+    - name: Commit results
+      run: |
+        git config --local user.email "tycoon_rusty.1h@icloud.com"
+        git config --local user.name "ctrlclaire"
+        git add exports/
+        git commit -m "📊 API extract - $(date '+%Y-%m-%d')" || exit 0
+        git push
+        
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: commits-extract
+        path: exports/
