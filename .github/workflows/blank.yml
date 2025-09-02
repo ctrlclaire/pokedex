@@ -1,0 +1,43 @@
+name: Generate Audit Report
+
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  generate-audit-report:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node (optionnel pour React)
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Generate audit report
+        run: |
+          mkdir -p audit-reports
+          REPORT_FILE="audit-reports/audit-$(date +'%Y-%m-%d_%H-%M-%S').md"
+          echo "# Audit Report" >> $REPORT_FILE
+          echo "**Date:** $(date)" >> $REPORT_FILE
+          echo "**Repository:** $GITHUB_REPOSITORY" >> $REPORT_FILE
+          echo "**PR Title:** ${{ github.event.pull_request.title }}" >> $REPORT_FILE
+          echo "**PR Number:** #${{ github.event.pull_request.number }}" >> $REPORT_FILE
+          echo "**Merged By:** ${{ github.event.pull_request.merged_by.login }}" >> $REPORT_FILE
+          echo "**Author:** ${{ github.event.pull_request.user.login }}" >> $REPORT_FILE
+          echo "**Base Branch:** ${{ github.event.pull_request.base.ref }}" >> $REPORT_FILE
+          echo "**Commits:**" >> $REPORT_FILE
+          git log ${{ github.event.pull_request.base.sha }}..${{ github.sha }} --pretty=format:'- %h %an %s' >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "**Files Changed:**" >> $REPORT_FILE
+          git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.sha }} >> $REPORT_FILE
+
+      - name: Upload audit report as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: audit-report
