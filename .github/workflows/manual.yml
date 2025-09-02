@@ -1,0 +1,32 @@
+name: Compliance Audit
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, closed]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Generate audit report
+      run: |
+        echo "=== AUDIT REPORT $(date) ===" >> audit-report.md
+        echo "Branch: ${{ github.ref_name }}" >> audit-report.md
+        echo "Actor: ${{ github.actor }}" >> audit-report.md
+        echo "Event: ${{ github.event_name }}" >> audit-report.md
+        
+        # Git log des derniers commits
+        git log --oneline -10 --pretty=format:"%h %an %ad %s" >> audit-report.md
+        
+    - name: Commit audit report
+      run: |
+        git config --local user.name "GitHub Actions"
+        git config --local user.email "actions@github.com"
+        git add audit-report.md
+        git commit -m "Automated audit report - $(date)"
+        git push
