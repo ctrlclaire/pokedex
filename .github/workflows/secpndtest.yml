@@ -1,0 +1,60 @@
+name: second test
+
+on:
+  workflow_dispatch: 
+
+jobs:
+  generate-report-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Generate Report (PR and Commits)
+        env:
+          GITHUB_TOKEN: ${{ secrets.API_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "GitHub Repository Report" > gdv-gplus-app-rapports-vision-report.txt
+          echo "Date de génération : $(date '+%Y-%m-%d %H:%M:%S')" >> gdv-gplus-app-rapports-vision-report.txt
+          echo "--------------------------------------------------------" >> gdv-gplus-app-rapports-vision-report.txt
+
+          # --- Pull Requests ---
+          response_prs=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/pulls?per_page=3")
+
+          count_prs=$(echo "$response_prs" | jq length)
+
+          if [ "$count_prs" -eq 0 ]; then
+            echo "Aucun pull request trouvé pour ce dépôt." >> gdv-gplus-app-rapports-vision-report.txt
+          else
+            echo "$response_prs" | jq -r '.[] | "Titre: \(.title)\nAuteur: \(.user.login)\nCréé le: \(.created_at)\nStatut: \(.state)\n---"' >> gdv-gplus-app-rapports-vision-report.txt
+          fi
+
+          echo "" >> gdv-gplus-app-rapports-vision-report.txt
+          echo "--------------------------------------------------------" >> gdv-gplus-app-rapports-vision-report.txt
+
+          # --- Commits ---
+          response_commits=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/commits?per_page=3")
+
+          count_commits=$(echo "$response_commits" | jq length)
+
+          if [ "$count_commits" -eq 0 ]; then
+            echo "Aucun commit trouvé pour ce dépôt." >> gdv-gplus-app-rapports-vision-report.txt
+          else
+            echo "$response_commits" | jq -r '.[] | "Message: \(.commit.message)\nAuteur: \(.commit.author.name)\nDate: \(.commit.author.date)\n---"' >> gdv-gplus-app-rapports-vision-report.txt
+          fi
+
+      - name: Upload Combined Report as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-repo-report
+          path: gdv-gplus-app-rapports-vision-report.txt
