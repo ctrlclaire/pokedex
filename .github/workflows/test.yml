@@ -1,87 +1,106 @@
-# .github/workflows/simple-extractor.yml
-name: Simple API Extract
+name: "Audit Rapport GitHub"
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 9 * * 1' # Lundi 9h
+  workflow_dispatch: # Lancement manuel
 
 jobs:
-  extract:
+  generate-audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      
+
     steps:
-    - uses: actions/checkout@v4
-      
-    - name: Extract API data
-      run: |
-        mkdir -p exports
-        DATE=$(date +"%Y%m%d_%H%M")
-        
-        # Extract commits from specific repo
-        curl -s "https://api.github.com/repos/ctrlclaire/pokedex/commits?per_page=20" > raw_commits.json
-        
-        # Check if curl succeeded
-        if [ ! -s raw_commits.json ]; then
-          echo "Erreur: Impossible de récupérer les données"
-          exit 1
-        fi
-        
-        # Create output file
-        echo "=== COMMITS AUDIT POKEDEX - $(date) ===" > exports/commits_${DATE}.txt
-        echo "Repository: ctrlclaire/pokedex" >> exports/commits_${DATE}.txt
-        echo "" >> exports/commits_${DATE}.txt
-        
-        # Install jq if not available
-        sudo apt-get update -qq && sudo apt-get install -y jq
-        
-        # Simple parsing with basic jq
-        echo "SHA | Date | Auteur | Signé | Message" >> exports/commits_${DATE}.txt
-        echo "----|----- |--------|-------|--------" >> exports/commits_${DATE}.txt
-        
-        # Parse JSON and format
-        cat raw_commits.json | jq -r '.[] | 
-        (.sha[0:7]) + " | " + 
-        (.commit.author.date[0:10]) + " | " + 
-        .commit.author.name + " | " + 
-        (if .commit.verification.verified then "✅" else "❌" end) + " | " + 
-        (.commit.message | split("\n")[0] | .[0:40])' >> exports/commits_${DATE}.txt
-        
-        # Simple stats
-        echo "" >> exports/commits_${DATE}.txt
-        echo "STATISTIQUES:" >> exports/commits_${DATE}.txt
-        echo "=============" >> exports/commits_${DATE}.txt
-        
-        TOTAL=$(cat raw_commits.json | jq 'length')
-        SIGNED=$(cat raw_commits.json | jq '[.[] | select(.commit.verification.verified == true)] | length')
-        UNSIGNED=$(cat raw_commits.json | jq '[.[] | select(.commit.verification.verified == false)] | length')
-        
-        echo "Total commits analysés: $TOTAL" >> exports/commits_${DATE}.txt
-        echo "Commits avec signature GPG: $SIGNED" >> exports/commits_${DATE}.txt
-        echo "Commits sans signature: $UNSIGNED" >> exports/commits_${DATE}.txt
-        
-        # Verification hash
-        echo "" >> exports/commits_${DATE}.txt
-        echo "Hash de vérification: $(sha256sum exports/commits_${DATE}.txt | cut -d' ' -f1)" >> exports/commits_${DATE}.txt
-        
-        # Show content for debugging
-        echo "Contenu généré:"
-        cat exports/commits_${DATE}.txt
-        
-        rm raw_commits.json
-        
-    - name: Commit results
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "Simple Extractor"
-        git add exports/
-        git commit -m "📊 API extract - $(date '+%Y-%m-%d')" || exit 0
-        git push
-        
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: commits-extract
-        path: exports/
+      # 1. Checkout du repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Installer jq avec version verrouillée
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq=1.7* pandoc
+
+      # 3. Récupérer les infos du dépôt
+      - name: Fetch repo data
+        env:
+          GITHUB_TOKEN: ${{ secrets.API_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "Fetching repo data..."
+          response=$(curl -s -H "Accept: application/vnd.github+json" \
+                           -H "Authorization: Bearer $GITHUB_TOKEN" \
+                           "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO")
+
+          # Vérifier si JSON valide
+          if echo "$response" | jq empty >/dev/null 2>&1; then
+            echo "$response" > response.json
+          else
+            echo "{}" > response.json
+          fi
+
+      # 4. Générer un rapport formaté
+      - name: Generate audit report
+        run: |
+          repo_name=$(jq -r '.full_name // "N/A"' response.json)
+          stars=$(jq -r '.stargazers_count // 0' response.json)
+          forks=$(jq -r '.forks_count // 0' response.json)
+          open_issues=$(jq -r '.open_issues_count // 0' response.json)
+          last_update=$(jq -r '.updated_at // "N/A"' response.json)
+
+          echo "===== RAPPORT D'AUDIT GITHUB =====" > audit-report.txt
+          echo "Repository   : $repo_name" >> audit-report.txt
+          echo "Dernière MAJ : $last_update" >> audit-report.txt
+          echo "=================================" >> audit-report.txt
+          echo "" >> audit-report.txt
+
+      # 5. Récupérer les 3 dernières PR sur main
+      - name: Fetch last 3 PRs
+        env:
+          GITHUB_TOKEN: ${{ secrets.API_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          response_prs=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+                              -H "Authorization: Bearer $GITHUB_TOKEN" \
+                              "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/pulls?state=all&base=main&per_page=3")
+
+          count_prs=$(echo "$response_prs" | jq length)
+
+          echo "===== DERNIÈRES PULL REQUESTS (main) =====" >> audit-report.txt
+
+          if [ "$count_prs" -eq 0 ]; then
+            echo "Aucune PR trouvée." >> audit-report.txt
+          else
+            echo "$response_prs" | jq -r '.[] | "Titre: \(.title)\nAuteur: \(.user.login)\nCréé le: \(.created_at)\nStatut: \(.state)\n---"' >> audit-report.txt
+          fi
+
+          echo "" >> audit-report.txt
+
+      # 6. Récupérer les 3 derniers commits
+      - name: Fetch last 3 commits
+        env:
+          GITHUB_TOKEN: ${{ secrets.API_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          response_commits=$(curl -s -H "Accept: application/vnd.github.v3+json" \
+                                  -H "Authorization: Bearer $GITHUB_TOKEN" \
+                                  "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/commits?per_page=3")
+
+          count_commits=$(echo "$response_commits" | jq length)
+
+          echo "===== DERNIERS COMMITS =====" >> audit-report.txt
+
+          if [ "$count_commits" -eq 0 ]; then
+            echo "Aucun commit trouvé." >> audit-report.txt
+          else
+            echo "$response_commits" | jq -r '.[] | "Message: \(.commit.message)\nAuteur: \(.commit.author.name)\nDate: \(.commit.author.date)\n---"' >> audit-report.txt
+          fi
+
+      # 8. Convertion TXT > PDF
+      - name: Convert TXT to PDF
+        run: pandoc gdv-gplus-app-rapports-vision-report.txt -o gdv-gplus-app-rapports-vision-report.pdf
+
+      # 8. Upload du rapport
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report
+          path: audit-report.txt
