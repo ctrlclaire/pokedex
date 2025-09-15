@@ -25,7 +25,8 @@ env:
 
 jobs:
   generate-report:
-    runs-on: ubuntu-latest
+    runs-on: gha-medium-ubuntu-nprod                # runner interne Ubuntu
+
     steps:
       - name: Install tools (jq + wkhtmltopdf)
         run: |
@@ -46,7 +47,7 @@ jobs:
 
           REPORT_TXT="Audit-${REPO}-${START}_to_${END}.txt"
 
-          # ---------- API ----------
+          # ---------- Helpers API ----------
           api() {
             curl -fsSL \
               -H "Accept: application/vnd.github.v3+json" \
@@ -55,8 +56,7 @@ jobs:
               "$1"
           }
 
-          # PR par état (open/closed/all) avec pagination
-          fetch_prs_by_state() {
+          fetch_prs_by_state() { # open|closed
             local state="$1" page=1 tmp
             tmp="$(mktemp -d)"
             while :; do
@@ -70,14 +70,12 @@ jobs:
             jq -s 'add' "${tmp}"/prs_*.json 2>/dev/null || echo "[]"
           }
 
-          # Détail d'une PR (contient merged_by etc.)
-          fetch_single_pr() {
+          fetch_single_pr() { # détail: merged_by, merged_at…
             local number="$1"
             api "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}"
           }
 
-          # Commentaires d'issue (pagination)
-          fetch_issue_comments() {
+          fetch_issue_comments() { # commentaires (pagination)
             local number="$1" page=1 tmp
             tmp="$(mktemp -d)"
             while :; do
@@ -91,8 +89,7 @@ jobs:
             jq -s 'add' "${tmp}"/c_*.json 2>/dev/null || echo "[]"
           }
 
-          # Reviews d'une PR (pagination)
-          fetch_pr_reviews() {
+          fetch_pr_reviews() { # reviews (pagination)
             local number="$1" page=1 tmp
             tmp="$(mktemp -d)"
             while :; do
@@ -106,11 +103,17 @@ jobs:
             jq -s 'add' "${tmp}"/r_*.json 2>/dev/null || echo "[]"
           }
 
-          # ---------- Récupération des PRs ----------
+          # ---------- Début du .txt : section uniquement (pas d’en-tête duplicatif) ----------
+          {
+            echo "PRs"
+            echo "==========="
+          } > "${REPORT_TXT}"
+
+          # ---------- Récupération ----------
           fetch_prs_by_state "closed" > all_prs_closed.json
           fetch_prs_by_state "open"   > all_prs_open.json
 
-          # Filtres par section
+          # Fermées (mergées) filtrées période + branche
           jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
             [ .[]
               | select(.merged_at != null)
@@ -119,6 +122,7 @@ jobs:
             ]
           ' all_prs_closed.json > merged_prs.json
 
+          # Ouvertes filtrées période (création) + branche
           jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
             [ .[]
               | select(.state == "open")
@@ -127,7 +131,7 @@ jobs:
             ]
           ' all_prs_open.json > open_prs.json
 
-          # ---------- Triage par date de création (desc) ----------
+          # Index combiné trié par date de création desc
           jq -s '
             def pick(o): {number: o.number, created_at: o.created_at};
             (.[0] // []) as $merged
@@ -138,21 +142,22 @@ jobs:
 
           total="$(jq 'length' combined_index.json)"
           if [[ "${total}" -eq 0 ]]; then
-            {
-              echo "Aucun résultat pour la période sélectionnée."
-            } >> "${REPORT_TXT}"
+            echo "Aucun résultat pour la période sélectionnée." >> "${REPORT_TXT}"
           else
             for n in $(jq -r '.[].number' combined_index.json); do
-              in_open="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' open_prs.json)"
-              in_merged="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' merged_prs.json)"
-
-              jq -r --argjson num "${n}" '
-                .[] | select(.number == $num)
+              # PR source: on regarde dans open puis closed
+              # 1) Bloc commun : numéro, titre, auteur, date de création
+              jq -r --argjson num "${n}" -s '
+                add
+                | map(select(.number == $num)) | .[0]
                 | "PR #\(.number) — \(.title)\n" +
                   "Auteur : \(.user.login)\n" +
-                  "Créée : \(.created_at | strptime(\"%Y-%m-%dT%H:%M:%SZ\") | strftime(\"%Y-%m-%d\"))"
-              ' all_prs_open.json all_prs_closed.json | head -n 3 >> "${REPORT_TXT}"
+                  "Créée : \(.created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y-%m-%d"))"
+              ' all_prs_open.json all_prs_closed.json >> "${REPORT_TXT}"
 
+              # 2) Statut + ligne "Mergé par : X le YYYY-MM-DD" si closed
+              in_open="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' open_prs.json)"
+              in_merged="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' merged_prs.json)"
               if [[ "${in_open}" == "true" ]]; then
                 echo "Statut : open" >> "${REPORT_TXT}"
               elif [[ "${in_merged}" == "true" ]]; then
@@ -165,7 +170,7 @@ jobs:
                 echo "Statut : inconnu" >> "${REPORT_TXT}"
               fi
 
-              # ---- Validations ----
+              # 3) Validations (reviews)
               reviews_json="$(fetch_pr_reviews "${n}")"
               approved_count="$(jq '[.[] | select(.state == "APPROVED")] | length' <<<"${reviews_json}")"
               echo "Validations:" >> "${REPORT_TXT}"
@@ -176,21 +181,22 @@ jobs:
                   [ .[] | select(.state == "APPROVED") ]
                   | sort_by(.submitted_at)
                   | map("- \(.user.login) | \(.submitted_at
-                           | strptime(\"%Y-%m-%dT%H:%M:%SZ\")
-                           | strftime(\"%Y-%m-%d\"))")
+                           | strptime("%Y-%m-%dT%H:%M:%SZ")
+                           | strftime("%Y-%m-%d"))")
                   | .[]
-                ' <<<"${reviews_json}" >> "${REPORT_TXT}"
+                ' <<< "${reviews_json}" >> "${REPORT_TXT}"
               fi
 
-              # ---- Commentaires ----
+              # 4) Commentaires (sans date)
               comments_json="$(fetch_issue_comments "${n}")"
               ccount="$(jq 'length' <<<"${comments_json}")"
               if [[ "${ccount}" -eq 0 ]]; then
                 echo "Commentaires : Aucun" >> "${REPORT_TXT}"
               else
                 echo "Commentaires :" >> "${REPORT_TXT}"
-                jq -r '.[] | "- \(.user.login) | \(.body | gsub("\r?\n"; " ") | gsub(" +"; " ") )"' \
-                  <<<"${comments_json}" >> "${REPORT_TXT}"
+                jq -r '
+                  .[] | "- \(.user.login) | \(.body | gsub("\r?\n"; " ") | gsub(" +"; " "))"
+                ' <<< "${comments_json}" >> "${REPORT_TXT}"
               fi
 
               echo "----------------------------------------------" >> "${REPORT_TXT}"
