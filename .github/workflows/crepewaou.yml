@@ -25,7 +25,7 @@ env:
 
 jobs:
   generate-report:
-    runs-on: gha-medium-ubuntu-nprod                # runner interne Ubuntu
+    runs-on: ubuntu-latest              # runner interne Ubuntu
 
     steps:
       - name: Install tools (jq + wkhtmltopdf)
