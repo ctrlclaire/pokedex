@@ -26,6 +26,10 @@ env:
 jobs:
   generate-report:
     runs-on: ubuntu-latest              # runner interne Ubuntu
+    env:
+      START:  ${{ inputs.start_date }}
+      END:    ${{ inputs.end_date }}
+      BRANCH: ${{ inputs.target_branch }}
 
     steps:
       - name: Install tools (jq + wkhtmltopdf)
@@ -102,12 +106,6 @@ jobs:
             done
             jq -s 'add' "${tmp}"/r_*.json 2>/dev/null || echo "[]"
           }
-
-          # ---------- Début du .txt : section uniquement (pas d’en-tête duplicatif) ----------
-          {
-            echo "PRs"
-            echo "==========="
-          } > "${REPORT_TXT}"
 
           # ---------- Récupération ----------
           fetch_prs_by_state "closed" > all_prs_closed.json
