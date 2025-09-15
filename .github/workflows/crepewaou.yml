@@ -19,13 +19,13 @@ permissions:
   pull-requests: read
 
 env:
-  GITHUB_TOKEN: ${{ secrets.API_TOKEN }}            # ou secrets.GITHUB_TOKEN
+  GITHUB_TOKEN: ${{ secrets.API_TOKEN }}           # ou secrets.GITHUB_TOKEN
   OWNER: ${{ github.repository_owner }}
   REPO:  ${{ github.event.repository.name }}
 
 jobs:
   generate-report:
-    runs-on: ubuntu-latest              # runner interne Ubuntu
+    runs-on: ubuntu-latest
     env:
       START:  ${{ inputs.start_date }}
       END:    ${{ inputs.end_date }}
@@ -42,14 +42,14 @@ jobs:
       - name: Build PR audit report (.txt)
         id: build_txt
         shell: bash
-        env:
-          START:  ${{ inputs.start_date }}
-          END:    ${{ inputs.end_date }}
-          BRANCH: ${{ inputs.target_branch }}
         run: |
           set -euo pipefail
 
           REPORT_TXT="Audit-${REPO}-${START}_to_${END}.txt"
+
+          # ---------- Temp dir & cleanup ----------
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
 
           # ---------- Helpers API ----------
           api() {
@@ -60,102 +60,89 @@ jobs:
               "$1"
           }
 
-          fetch_prs_by_state() { # open|closed
-            local state="$1" page=1 tmp
-            tmp="$(mktemp -d)"
+          # Pagination générique : base_url (+ ? si besoin) -> concatène toutes les pages
+          fetch_all_pages() {
+            local base_url="$1" prefix="$2"
+            local page=1
+            local sep='?'
+            [[ "$base_url" == *\?* ]] && sep='&'
             while :; do
-              local url="https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=${state}&per_page=100&page=${page}"
-              local out="${tmp}/prs_${page}.json"
+              local url="${base_url}${sep}per_page=100&page=${page}"
+              local out="${TMPDIR}/${prefix}_${page}.json"
               api "$url" > "$out"
               local len; len="$(jq 'length' "$out")"
               [[ "$len" -eq 0 ]] && break
               page=$((page+1))
             done
-            jq -s 'add' "${tmp}"/prs_*.json 2>/dev/null || echo "[]"
+            jq -s 'add' "${TMPDIR}/${prefix}_".*.json 2>/dev/null || echo "[]"
           }
 
+          # Endpoints spécifiques
+          fetch_prs_by_state() { # open | closed
+            local state="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=${state}" "prs_${state}"
+          }
           fetch_single_pr() { # détail: merged_by, merged_at…
             local number="$1"
             api "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}"
           }
-
-          fetch_issue_comments() { # commentaires (pagination)
-            local number="$1" page=1 tmp
-            tmp="$(mktemp -d)"
-            while :; do
-              local url="https://api.github.com/repos/${OWNER}/${REPO}/issues/${number}/comments?per_page=100&page=${page}"
-              local out="${tmp}/c_${page}.json"
-              api "$url" > "$out"
-              local len; len="$(jq 'length' "$out")"
-              [[ "$len" -eq 0 ]] && break
-              page=$((page+1))
-            done
-            jq -s 'add' "${tmp}"/c_*.json 2>/dev/null || echo "[]"
+          fetch_issue_comments() {
+            local number="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/issues/${number}/comments" "c_${number}"
           }
-
-          fetch_pr_reviews() { # reviews (pagination)
-            local number="$1" page=1 tmp
-            tmp="$(mktemp -d)"
-            while :; do
-              local url="https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}/reviews?per_page=100&page=${page}"
-              local out="${tmp}/r_${page}.json"
-              api "$url" > "$out"
-              local len; len="$(jq 'length' "$out")"
-              [[ "$len" -eq 0 ]] && break
-              page=$((page+1))
-            done
-            jq -s 'add' "${tmp}"/r_*.json 2>/dev/null || echo "[]"
+          fetch_pr_reviews() {
+            local number="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}/reviews" "r_${number}"
           }
 
           # ---------- Récupération ----------
-          fetch_prs_by_state "closed" > all_prs_closed.json
-          fetch_prs_by_state "open"   > all_prs_open.json
+          fetch_prs_by_state "closed" > "${TMPDIR}/all_prs_closed.json"
+          fetch_prs_by_state "open"   > "${TMPDIR}/all_prs_open.json"
 
-          # Fermées (mergées) filtrées période + branche
+          # Filtrer PRs mergées dans la période et la branche
           jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
             [ .[]
               | select(.merged_at != null)
               | select(.base.ref == $branch)
               | select(.merged_at[0:10] >= $s and .merged_at[0:10] <= $e)
             ]
-          ' all_prs_closed.json > merged_prs.json
+          ' "${TMPDIR}/all_prs_closed.json" > "${TMPDIR}/merged_prs.json"
 
-          # Ouvertes filtrées période (création) + branche
+          # Filtrer PRs ouvertes créées dans la période et la branche
           jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
             [ .[]
               | select(.state == "open")
               | select(.base.ref == $branch)
               | select(.created_at[0:10] >= $s and .created_at[0:10] <= $e)
             ]
-          ' all_prs_open.json > open_prs.json
+          ' "${TMPDIR}/all_prs_open.json" > "${TMPDIR}/open_prs.json"
 
-          # Index combiné trié par date de création desc
+          # Index combiné (open + merged), tri par created_at desc
           jq -s '
             def pick(o): {number: o.number, created_at: o.created_at};
             (.[0] // []) as $merged
             | (.[1] // []) as $open
             | ( ($merged | map(pick(.))) + ($open | map(pick(.))) )
             | sort_by(.created_at) | reverse
-          ' merged_prs.json open_prs.json > combined_index.json
+          ' "${TMPDIR}/merged_prs.json" "${TMPDIR}/open_prs.json" > "${TMPDIR}/combined_index.json"
 
-          total="$(jq 'length' combined_index.json)"
+          total="$(jq 'length' "${TMPDIR}/combined_index.json")"
           if [[ "${total}" -eq 0 ]]; then
-            echo "Aucun résultat pour la période sélectionnée." >> "${REPORT_TXT}"
+            echo "Aucun résultat trouvé entre ${START} et ${END} sur ${BRANCH}." >> "${REPORT_TXT}"
           else
-            for n in $(jq -r '.[].number' combined_index.json); do
-              # PR source: on regarde dans open puis closed
-              # 1) Bloc commun : numéro, titre, auteur, date de création
+            for n in $(jq -r '.[].number' "${TMPDIR}/combined_index.json"); do
+              # Bloc commun : numéro, titre, auteur, date de création
               jq -r --argjson num "${n}" -s '
                 add
                 | map(select(.number == $num)) | .[0]
                 | "PR #\(.number) — \(.title)\n" +
                   "Auteur : \(.user.login)\n" +
                   "Créée : \(.created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y-%m-%d"))"
-              ' all_prs_open.json all_prs_closed.json >> "${REPORT_TXT}"
+              ' "${TMPDIR}/all_prs_open.json" "${TMPDIR}/all_prs_closed.json" >> "${REPORT_TXT}"
 
-              # 2) Statut + ligne "Mergé par : X le YYYY-MM-DD" si closed
-              in_open="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' open_prs.json)"
-              in_merged="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' merged_prs.json)"
+              # Statut + merge details si fermée/mergée
+              in_open="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' "${TMPDIR}/open_prs.json")"
+              in_merged="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' "${TMPDIR}/merged_prs.json")"
               if [[ "${in_open}" == "true" ]]; then
                 echo "Statut : open" >> "${REPORT_TXT}"
               elif [[ "${in_merged}" == "true" ]]; then
@@ -168,7 +155,7 @@ jobs:
                 echo "Statut : inconnu" >> "${REPORT_TXT}"
               fi
 
-              # 3) Validations (reviews)
+              # Validations (reviews)
               reviews_json="$(fetch_pr_reviews "${n}")"
               approved_count="$(jq '[.[] | select(.state == "APPROVED")] | length' <<<"${reviews_json}")"
               echo "Validations:" >> "${REPORT_TXT}"
@@ -179,13 +166,13 @@ jobs:
                   [ .[] | select(.state == "APPROVED") ]
                   | sort_by(.submitted_at)
                   | map("- \(.user.login) | \(.submitted_at
-                           | strptime("%Y-%m-%dT%H:%M:%SZ")
-                           | strftime("%Y-%m-%d"))")
+                           | strptime(\"%Y-%m-%dT%H:%M:%SZ\")
+                           | strftime(\"%Y-%m-%d\"))")
                   | .[]
                 ' <<< "${reviews_json}" >> "${REPORT_TXT}"
               fi
 
-              # 4) Commentaires (sans date)
+              # Commentaires (sans date)
               comments_json="$(fetch_issue_comments "${n}")"
               ccount="$(jq 'length' <<<"${comments_json}")"
               if [[ "${ccount}" -eq 0 ]]; then
@@ -211,10 +198,12 @@ jobs:
           HTML="report.html"
           PDF="${TXT_READY%.txt}.pdf"
 
+          # Échappe le texte pour l’inclure dans le HTML
           esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
+          # En-tête HTML + contenu en <pre> (monospace)
           {
-            echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+            echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             echo '<style>'
             echo ':root{--ink:#111;--muted:#555;--rule:#e5e7eb;}*{box-sizing:border-box}'
             echo 'html,body{margin:0;padding:0;color:var(--ink)}'
@@ -233,14 +222,8 @@ jobs:
             echo '    </pre></main></body></html>'
           } > "${HTML}"
 
-          wkhtmltopdf \
-            --margin-top 20 --margin-bottom 18 --margin-left 10 --margin-right 10 \
-            --header-left "PR Audit — '"${REPO}"'" \
-            --header-right "'"${START} → ${END}"'" \
-            --header-line --header-spacing 5 \
-            --footer-center "Page [page] / [toPage]" \
-            --footer-line --footer-spacing 5 \
-            "${HTML}" "${PDF}"
+          # Build Ubuntu (Qt non patchée) : pas d'options header/footer
+          wkhtmltopdf "${HTML}" "${PDF}"
 
           echo "PDF_READY=${PDF}" >> $GITHUB_ENV
 
