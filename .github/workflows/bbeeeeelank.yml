@@ -1,0 +1,229 @@
+name: PR Audit Report 34
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Date de début (YYYY-MM-DD)"
+        required: true
+      end_date:
+        description: "Date de fin (YYYY-MM-DD)"
+        required: true
+      target_branch:
+        description: "Branche cible (ex: main)"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}           # ou secrets.GITHUB_TOKEN
+  OWNER: ${{ github.repository_owner }}
+  REPO:  ${{ github.event.repository.name }}
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    env:
+      START:  ${{ inputs.start_date }}
+      END:    ${{ inputs.end_date }}
+      BRANCH: ${{ inputs.target_branch }}
+
+    steps:
+      - name: Install tools (jq + wkhtmltopdf)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -yq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            jq wkhtmltopdf fonts-dejavu-core
+
+      - name: Build PR audit report (.txt)
+        id: build_txt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_TXT="Audit-${REPO}-${START}_to_${END}.txt"
+
+          # ---------- Temp dir & cleanup ----------
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
+
+          # ---------- Helpers API ----------
+          api() {
+            curl -fsSL \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          # Pagination générique : base_url (+ ? si besoin) -> concatène toutes les pages
+          fetch_all_pages() {
+            local base_url="$1" prefix="$2"
+            local page=1
+            local sep='?'
+            [[ "$base_url" == *\?* ]] && sep='&'
+            while :; do
+              local url="${base_url}${sep}per_page=100&page=${page}"
+              local out="${TMPDIR}/${prefix}_${page}.json"
+              api "$url" > "$out"
+              local len; len="$(jq 'length' "$out")"
+              [[ "$len" -eq 0 ]] && break
+              page=$((page+1))
+            done
+            jq -s 'add' "${TMPDIR}/${prefix}_".*.json 2>/dev/null || echo "[]"
+          }
+
+          # Endpoints spécifiques
+          fetch_prs_by_state() { # open | closed
+            local state="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=${state}" "prs_${state}"
+          }
+          fetch_single_pr() { # détail: merged_by, merged_at…
+            local number="$1"
+            api "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}"
+          }
+          fetch_issue_comments() {
+            local number="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/issues/${number}/comments" "c_${number}"
+          }
+          fetch_pr_reviews() {
+            local number="$1"
+            fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls/${number}/reviews" "r_${number}"
+          }
+
+          # ---------- Récupération ----------
+          fetch_prs_by_state "closed" > "${TMPDIR}/all_prs_closed.json"
+          fetch_prs_by_state "open"   > "${TMPDIR}/all_prs_open.json"
+
+          # Filtrer PRs mergées dans la période et la branche
+          jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
+            [ .[]
+              | select(.merged_at != null)
+              | select(.base.ref == $branch)
+              | select(.merged_at[0:10] >= $s and .merged_at[0:10] <= $e)
+            ]
+          ' "${TMPDIR}/all_prs_closed.json" > "${TMPDIR}/merged_prs.json"
+
+          # Filtrer PRs ouvertes créées dans la période et la branche
+          jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
+            [ .[]
+              | select(.state == "open")
+              | select(.base.ref == $branch)
+              | select(.created_at[0:10] >= $s and .created_at[0:10] <= $e)
+            ]
+          ' "${TMPDIR}/all_prs_open.json" > "${TMPDIR}/open_prs.json"
+
+          # Index combiné (open + merged), tri par created_at desc
+          jq -s '
+            def pick(o): {number: o.number, created_at: o.created_at};
+            (.[0] // []) as $merged
+            | (.[1] // []) as $open
+            | ( ($merged | map(pick(.))) + ($open | map(pick(.))) )
+            | sort_by(.created_at) | reverse
+          ' "${TMPDIR}/merged_prs.json" "${TMPDIR}/open_prs.json" > "${TMPDIR}/combined_index.json"
+
+          total="$(jq 'length' "${TMPDIR}/combined_index.json")"
+          if [[ "${total}" -eq 0 ]]; then
+            echo "Aucun résultat trouvé entre ${START} et ${END} sur ${BRANCH}." >> "${REPORT_TXT}"
+          else
+            for n in $(jq -r '.[].number' "${TMPDIR}/combined_index.json"); do
+              # Bloc commun : numéro, titre, auteur, date de création
+              jq -r --argjson num "${n}" -s '
+                add
+                | map(select(.number == $num)) | .[0]
+                | "PR #\(.number) — \(.title)\n" +
+                  "Auteur : \(.user.login)\n" +
+                  "Créée : \(.created_at | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y-%m-%d"))"
+              ' "${TMPDIR}/all_prs_open.json" "${TMPDIR}/all_prs_closed.json" >> "${REPORT_TXT}"
+
+              # Statut + merge details si fermée/mergée
+              in_open="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' "${TMPDIR}/open_prs.json")"
+              in_merged="$(jq --argjson num "${n}" 'any(.[]; .number == $num)' "${TMPDIR}/merged_prs.json")"
+              if [[ "${in_open}" == "true" ]]; then
+                echo "Statut : open" >> "${REPORT_TXT}"
+              elif [[ "${in_merged}" == "true" ]]; then
+                pr_detail="$(fetch_single_pr "${n}")"
+                merged_by="$(jq -r '.merged_by.login // "inconnu"' <<< "${pr_detail}")"
+                merged_date="$(jq -r '.merged_at | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y-%m-%d")' <<< "${pr_detail}")"
+                echo "Mergé par : ${merged_by} le ${merged_date}" >> "${REPORT_TXT}"
+                echo "Statut : closed" >> "${REPORT_TXT}"
+              else
+                echo "Statut : inconnu" >> "${REPORT_TXT}"
+              fi
+
+              # Validations (reviews)
+              reviews_json="$(fetch_pr_reviews "${n}")"
+              approved_count="$(jq '[.[] | select(.state == "APPROVED")] | length' <<<"${reviews_json}")"
+              echo "Validations:" >> "${REPORT_TXT}"
+              if [[ "${approved_count}" -eq 0 ]]; then
+                echo "- Aucune approbation trouvée" >> "${REPORT_TXT}"
+              else
+                jq -r '
+                  [ .[] | select(.state == "APPROVED") ]
+                  | sort_by(.submitted_at)
+                  | map("- \(.user.login) | \(.submitted_at
+                           | strptime(\"%Y-%m-%dT%H:%M:%SZ\")
+                           | strftime(\"%Y-%m-%d\"))")
+                  | .[]
+                ' <<< "${reviews_json}" >> "${REPORT_TXT}"
+              fi
+
+              # Commentaires (sans date)
+              comments_json="$(fetch_issue_comments "${n}")"
+              ccount="$(jq 'length' <<<"${comments_json}")"
+              if [[ "${ccount}" -eq 0 ]]; then
+                echo "Commentaires : Aucun" >> "${REPORT_TXT}"
+              else
+                echo "Commentaires :" >> "${REPORT_TXT}"
+                jq -r '
+                  .[] | "- \(.user.login) | \(.body | gsub("\r?\n"; " ") | gsub(" +"; " "))"
+                ' <<< "${comments_json}" >> "${REPORT_TXT}"
+              fi
+
+              echo "----------------------------------------------" >> "${REPORT_TXT}"
+            done
+          fi
+
+          echo "TXT_READY=${REPORT_TXT}" >> $GITHUB_ENV
+
+      - name: Convert TXT to PDF (wkhtmltopdf)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HTML="report.html"
+          PDF="${TXT_READY%.txt}.pdf"
+
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+          {
+            echo '<!doctype html><html><head><meta charset="utf-8">'
+            echo '<style>'
+            echo 'body{font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#111;margin:24px;}'
+            echo 'h1{font-size:18px;margin:0 0 6px 0;}'
+            echo '.meta{font-size:11px;color:#555;margin:0 0 12px 0;}'
+            echo 'pre{white-space:pre-wrap;font-family:Courier,monospace;font-size:11px;line-height:1.4;margin:0;}'
+            echo '</style></head><body>'
+            echo "  <h1>PR Audit — ${REPO}</h1>"
+            echo "  <div class=\"meta\">Branche : <b>${BRANCH}</b> · Période : <b>${START}</b> → <b>${END}</b> · Généré le : <b>$(date '+%Y-%m-%d')</b></div>"
+            echo "  <pre>"
+            esc < "${TXT_READY}"
+            echo "  </pre>"
+            echo '</body></html>'
+          } > "${HTML}"
+
+          # Appel simplifié (pas d'options non supportées)
+          wkhtmltopdf "${HTML}" "${PDF}"
+
+          echo "PDF_READY=${PDF}" >> $GITHUB_ENV
+
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ env.REPO }}
+          path: ${{ env.PDF_READY }}
