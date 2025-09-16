@@ -14,12 +14,14 @@ on:
         required: true
         default: "main"
 
+
+# Permissions minimales : lecture du contenu et des PRs uniquement.
 permissions:
   contents: read
   pull-requests: read
 
 env:
-  GITHUB_TOKEN: ${{ secrets.API_TOKEN }}   # Token entreprise
+  GITHUB_TOKEN: ${{ secrets.API_TOKEN }}
   OWNER: ${{ github.repository_owner }}
   REPO:  ${{ github.event.repository.name }}
 
@@ -31,7 +33,10 @@ jobs:
       END:    ${{ inputs.end_date }}
       BRANCH: ${{ inputs.target_branch }}
 
-    steps:
+    steps:    
+    
+      # Installe jq (JSON), wkhtmltopdf (conversion HTML→PDF) et une police sûre.
+      
       - name: Install tools (jq + wkhtmltopdf)
         run: |
           set -euo pipefail
@@ -39,7 +44,9 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
             jq wkhtmltopdf fonts-dejavu-core
 
-      - name: Build PR audit report (.txt) — stream (no /tmp)
+      # Construit un .txt d’audit basé sur les PRs (ouvertes/mergées) sur la période.
+      
+      - name: Build PR audit report (.txt)
         id: build_txt
         shell: bash
         run: |
@@ -47,7 +54,8 @@ jobs:
           REPORT_TXT="Audit-${REPO}-${START}_to_${END}.txt"
           : > "${REPORT_TXT}"   # crée/vides le fichier
 
-          # ---------- HTTP helper ----------
+          # ---------- GET GitHub API ----------
+          
           api() {
             curl -fsSL \
               -H "Accept: application/vnd.github.v3+json" \
@@ -55,8 +63,12 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "$1"
           }
-
-          # ---------- Pagination générique ----------
+          
+          # fetch_all_pages(base_url) :
+          #   - Récupère toutes les pages d’une ressource GitHub (per_page=100).
+          #   - Boucle jusqu’à ce qu’aucune donnée ne soit renvoyée.
+          #   - Concatène toutes les pages en un tableau JSON unique.
+          
           fetch_all_pages() {
             local base_url="$1"
             local sep='?'; [[ "$base_url" == *\?* ]] && sep='&'
@@ -73,17 +85,22 @@ jobs:
             } | jq -s 'if length==0 then [] else add end'
           }
 
-          # ---------- Wrappers ----------
+          # ---------- Fonctions pour récupérer les données des PR ----------
+          # fetch_prs_by_state(state)     : renvoie toutes les PRs selon le state ("open" ou "closed").
+          # fetch_single_pr(number)       : renvoie le détail complet d’une PR (merged_by, dates, etc.).
+          # fetch_issue_comments(number)  : renvoie tous les commentaires associés à une PR (via son issue).
+          # fetch_pr_reviews(number)      : renvoie toutes les reviews d’une PR (APPROVED, CHANGES_REQUESTED…).
+          
           fetch_prs_by_state() {   fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=$1"; }
           fetch_single_pr()    {   api "https://api.github.com/repos/${OWNER}/${REPO}/pulls/$1"; }
           fetch_issue_comments(){  fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/issues/$1/comments"; }
           fetch_pr_reviews()   {   fetch_all_pages "https://api.github.com/repos/${OWNER}/${REPO}/pulls/$1/reviews"; }
 
-          # ---------- Récupération en mémoire ----------
-          all_closed="$(fetch_prs_by_state closed)"   # tableau JSON
-          all_open="$(fetch_prs_by_state open)"       # tableau JSON
+          all_closed="$(fetch_prs_by_state closed)"   
+          all_open="$(fetch_prs_by_state open)"       
 
-          # PRs mergées sur la période
+          # Filtre les PRs mergées : base = branche cible, période = START → END
+          
           merged_prs="$(
             jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
               [ .[]
@@ -94,7 +111,7 @@ jobs:
             ' <<<"$all_closed"
           )"
 
-          # PRs ouvertes sur la période
+          # Filtre les PRs ouvertes créées dans la période sur la branche cible
           open_prs="$(
             jq --arg s "${START}" --arg e "${END}" --arg branch "${BRANCH}" '
               [ .[]
@@ -105,7 +122,8 @@ jobs:
             ' <<<"$all_open"
           )"
 
-          # Index combiné trié
+          # Construit un index combinant PRs mergées et ouvertes, triées par date décroissante
+
           combined_index="$(
             jq -s '
               def pick(o): {number: o.number, created_at: o.created_at};
@@ -118,14 +136,16 @@ jobs:
 
           total="$(jq 'length' <<<"$combined_index")"
           if [[ "$total" -eq 0 ]]; then
-            echo "Aucun résultat trouvé entre ${START} et ${END} sur ${BRANCH}." >> "${REPORT_TXT}"
+            echo "Aucun résultat trouvé entre le ${START} et ${END} sur ${BRANCH}." >> "${REPORT_TXT}"
             echo "TXT_READY=${REPORT_TXT}" >> $GITHUB_ENV
             exit 0
           fi
 
-          # ---------- Boucle d'impression ----------
+          # ---------- Génère le rapport pour chaque PR ----------
+          
+          # numéro, titre, auteur, date de création
+          
           while IFS= read -r n; do
-            # Bloc commun
             jq -r --argjson num "$n" \
                   --arg fmt_in "%Y-%m-%dT%H:%M:%SZ" \
                   --arg fmt_out "%Y-%m-%d" \
@@ -137,7 +157,8 @@ jobs:
                 "Créée : \(.created_at | strptime($fmt_in) | strftime($fmt_out))"
             ' <(echo "$all_open") <(echo "$all_closed") >> "${REPORT_TXT}"
 
-            # Statut
+           # Statut de la PR (open, merged, closed)
+           
             in_open="$(jq --argjson num "$n" 'any(.[]; .number == $num)' <<<"$open_prs")"
             in_merged="$(jq --argjson num "$n" 'any(.[]; .number == $num)' <<<"$merged_prs")"
             if [[ "$in_open" == "true" ]]; then
@@ -153,7 +174,8 @@ jobs:
               echo "Statut : inconnu" >> "${REPORT_TXT}"
             fi
 
-            # Validations
+            # Liste des reviewers de la PR
+            
             reviews_json="$(fetch_pr_reviews "$n")"
             approved_count="$(jq '[.[] | select(.state == "APPROVED")] | length' <<<"$reviews_json")"
             if [[ "$approved_count" -eq 0 ]]; then
@@ -168,7 +190,8 @@ jobs:
               ' <<< "$reviews_json" >> "${REPORT_TXT}"
             fi
 
-            # Commentaires
+            # Liste des commentaires associés
+            
             comments_json="$(fetch_issue_comments "$n")"
             ccount="$(jq 'length' <<<"$comments_json")"
             if [[ "$ccount" -eq 0 ]]; then
@@ -185,6 +208,7 @@ jobs:
 
           echo "TXT_READY=${REPORT_TXT}" >> $GITHUB_ENV
 
+     # ---------- Génération du PDF ----------
       - name: Convert TXT to PDF (wkhtmltopdf)
         shell: bash
         run: |
@@ -204,6 +228,7 @@ jobs:
             echo '</style></head><body>'
             echo "  <h1>PR Audit — ${REPO}</h1>"
             echo "  <div class=\"meta\">Branche : <b>${BRANCH}</b> · Période : <b>${START}</b> → <b>${END}</b> · Généré le : <b>$(date '+%Y-%m-%d')</b></div>"
+            echo "  <hr style=\"margin:16px 0; border:none; border-top:1px solid #ccc;\">"
             echo "  <pre>"
             esc < "${TXT_READY}"
             echo "  </pre>"
