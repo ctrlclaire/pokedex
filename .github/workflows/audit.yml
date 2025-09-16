@@ -19,7 +19,7 @@ permissions:
   pull-requests: read
 
 env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # Token entreprise
+  GITHUB_TOKEN: ${{ secrets.API_TOKEN }}   # Token entreprise
   OWNER: ${{ github.repository_owner }}
   REPO:  ${{ github.event.repository.name }}
 
@@ -63,7 +63,6 @@ jobs:
             local base_url="$1"
             local sep='?'; [[ "$base_url" == *\?* ]] && sep='&'
             local page=1
-            # on envoie chaque page, puis jq -s 'add' assemble (ou [] si aucune)
             {
               while :; do
                 local url="${base_url}${sep}per_page=100&page=${page}"
@@ -129,12 +128,15 @@ jobs:
           # ---------- Boucle d'impression ----------
           while IFS= read -r n; do
             # Bloc commun (numéro/titre/auteur/created)
-            jq -r --argjson num "$n" -s '
+            jq -r --argjson num "$n" \
+                  --arg fmt_in "%Y-%m-%dT%H:%M:%SZ" \
+                  --arg fmt_out "%Y-%m-%d" \
+                  -s '
               add
               | map(select(.number == $num)) | .[0]
               | "PR #\(.number) — \(.title)\n" +
                 "Auteur : \(.user.login)\n" +
-                "Créée : \(.created_at | strptime(\"%Y-%m-%dT%H:%M:%SZ\") | strftime(\"%Y-%m-%d\"))"
+                "Créée : \(.created_at | strptime($fmt_in) | strftime($fmt_out))"
             ' <(echo "$all_open") <(echo "$all_closed") >> "${REPORT_TXT}"
 
             # Statut + details de merge si applicable
@@ -145,7 +147,8 @@ jobs:
             elif [[ "$in_merged" == "true" ]]; then
               pr_detail="$(fetch_single_pr "$n")"
               merged_by="$(jq -r '.merged_by.login // "inconnu"' <<< "$pr_detail")"
-              merged_date="$(jq -r '.merged_at | strptime("%Y-%m-%dT%H:%M:%SZ") | strftime("%Y-%m-%d")' <<< "$pr_detail")"
+              merged_date="$(jq -r --arg fmt_in "%Y-%m-%dT%H:%M:%SZ" --arg fmt_out "%Y-%m-%d" \
+                              '.merged_at | strptime($fmt_in) | strftime($fmt_out)' <<< "$pr_detail")"
               echo "Mergé par : ${merged_by} le ${merged_date}" >> "${REPORT_TXT}"
               echo "Statut : closed" >> "${REPORT_TXT}"
             else
@@ -159,12 +162,10 @@ jobs:
             if [[ "$approved_count" -eq 0 ]]; then
               echo "- Aucune approbation trouvée" >> "${REPORT_TXT}"
             else
-              jq -r '
+              jq -r --arg fmt_in "%Y-%m-%dT%H:%M:%SZ" --arg fmt_out "%Y-%m-%d" '
                 [ .[] | select(.state == "APPROVED") ]
                 | sort_by(.submitted_at)
-                | map("- \(.user.login) | \(.submitted_at
-                         | strptime(\"%Y-%m-%dT%H:%M:%SZ\")
-                         | strftime(\"%Y-%m-%d\"))")
+                | map("- \(.user.login) | \(.submitted_at | strptime($fmt_in) | strftime($fmt_out))")
                 | .[]
               ' <<< "$reviews_json" >> "${REPORT_TXT}"
             fi
